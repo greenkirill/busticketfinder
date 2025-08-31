@@ -75,7 +75,7 @@ async def checker_loop(bot: Bot):
                     must_periodic_report = has_matches and (now_ts - last_report_ts >= REPORT_EVERY_SEC)
 
                     is_change = bool(new_hash) and (new_hash != s.last_hash)
-                    should_send = is_change or must_periodic_report
+                    should_send = is_change # or must_periodic_report
 
                     logger.debug(
                         "sub#%s results: total=%s, in_range=%s, changed=%s, periodic=%s, send=%s, dt=%.3fs",
