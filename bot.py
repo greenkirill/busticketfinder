@@ -7,24 +7,54 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 import re
 
+import logging
+import os
+import sys
+from logging.handlers import RotatingFileHandler
+
 from config import CHECK_EVERY_SEC, REPORT_EVERY_SEC, TELEGRAM_BOT_TOKEN, SUBS_JSON
 from data import Storage
 from infobus_client import InfobusClient
 from points import list_points, resolve_city_or_id, search_points
 
+def setup_logging():
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    fmt = "%(asctime)s %(levelname)s [%(name)s:%(lineno)d] - %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if os.getenv("LOG_TO_FILE", "0") == "1":
+        log_file = os.getenv("LOG_FILE", "./bot.log")
+        handlers.append(RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8"))
+
+    logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
+
+    # чуть приглушим шум некоторых логгеров, если нужно
+    logging.getLogger("aiogram.client.session.middlewares.request_logging").setLevel(logging.WARNING)
+
+
+setup_logging()
+logger = logging.getLogger("bot")
 client = InfobusClient()
 storage = Storage(SUBS_JSON)
 router = Router()
 
 async def checker_loop(bot: Bot):
+    logger.info("checker_loop started; tick every %ss, periodic report %ss", CHECK_EVERY_SEC, REPORT_EVERY_SEC)
     while True:
         try:
             subs = storage.list_all_subs()
             checks_count = int(storage.get_meta("checks_count") or "0") + 1
+            logger.debug("tick #%s: total subs=%s", checks_count, len(subs))
 
             for s in subs:
+                t0 = time.monotonic()
                 try:
-                    # 1) получаем маршруты
+                    logger.debug("sub#%s GET %s->%s %s %s-%s",
+                                 s.id, s.city_from_id, s.city_to_id, s.date_str, s.dep_from_hhmm, s.dep_to_hhmm)
+
                     routes_json: Dict[str, Any] = client.get_routes(
                         city_from_id=s.city_from_id,
                         city_to_id=s.city_to_id,
@@ -34,24 +64,24 @@ async def checker_loop(bot: Bot):
                         screen_width=2560,
                         screen_height=1305,
                     )
-                    # 2) форматируем пары времен
                     times = client.extract_times(routes_json)
 
-                    # есть ли в диапазоне вообще что-то?
                     matches = [t for t in times if in_range(t["depart"], s.dep_from_hhmm, s.dep_to_hhmm)]
                     has_matches = len(matches) > 0
-
-                    # 3) считаем хэш по диапазону (для антидублей)
                     new_hash = hash_times_in_range(times, s.dep_from_hhmm, s.dep_to_hhmm)
 
-                    # 4) периодический отчёт: раз в REPORT_EVERY_SEC, если есть что показать
                     now_ts = int(time.time())
                     last_report_ts = int(storage.get_meta(f"sub:{s.id}:last_report_ts") or "0")
                     must_periodic_report = has_matches and (now_ts - last_report_ts >= REPORT_EVERY_SEC)
 
-                    # 5) отправляем, если: (А) появились изменения, или (Б) пора периодически отчитаться
                     is_change = bool(new_hash) and (new_hash != s.last_hash)
                     should_send = is_change or must_periodic_report
+
+                    logger.debug(
+                        "sub#%s results: total=%s, in_range=%s, changed=%s, periodic=%s, send=%s, dt=%.3fs",
+                        s.id, len(times), len(matches), is_change, must_periodic_report, should_send,
+                        time.monotonic() - t0
+                    )
 
                     if should_send and has_matches:
                         header = "⚡️ Обновление" if is_change else "⏱ Периодический отчёт"
@@ -66,22 +96,25 @@ async def checker_loop(bot: Bot):
 
                         await bot.send_message(chat_id=s.user_id, text="\n".join(lines))
 
-                        # фиксируем состояние и время последнего отчёта
                         if new_hash:
                             storage.update_last_hash(s.id, new_hash)
+                            logger.info("sub#%s sent %s items; last_hash updated", s.id, len(matches))
                         storage.set_meta(f"sub:{s.id}:last_report_ts", str(now_ts))
+                    else:
+                        # полезно знать, что нечего слать
+                        logger.debug("sub#%s no-send (has_matches=%s, changed=%s, periodic=%s)",
+                                     s.id, has_matches, is_change, must_periodic_report)
 
-                except Exception as e:
-                    # Локальная ошибка по конкретной подписке — логируем и идём дальше
-                    print(f"[checker] sub {s.id} error: {e}")
+                except Exception:
+                    logger.exception("checker: sub#%s failed", s.id)
 
             storage.set_meta("last_check_ts", str(int(time.time())))
             storage.set_meta("checks_count", str(checks_count))
-
-        except Exception as e:
-            print(f"[checker] loop error: {e}")
+        except Exception:
+            logger.exception("checker loop-level failure")
 
         await asyncio.sleep(CHECK_EVERY_SEC)
+
 
 
 def hhmm_to_int(hhmm: str) -> int:
@@ -145,11 +178,13 @@ def ensure_city(token: str) -> Tuple[str, str]:
 
 @router.message(Command("start"))
 async def start_cmd(m: Message):
+    logger.info("/start from user=%s", m.from_user.id if m.from_user else None)
     await m.answer("Привет! Я бот для слежения за билетами.\n" + HELP)
 
 @router.message(Command("points"))
 async def points_cmd(m: Message, command: CommandObject):
     q = (command.args or "").strip()
+    logger.info("/points user=%s query=%r", m.from_user.id if m.from_user else None, q)
     rows = search_points(q) if q else list_points()
     if not rows:
         await m.answer("Ничего не нашёл. Попробуй /points без параметров.")
@@ -165,6 +200,7 @@ async def subscribe_cmd(m: Message, command: CommandObject):
       /subscribe 01.09.2025 78 2 20:00 23:00
       /subscribe 01.09.2025 Vilnius Minsk 20:00 23:00
     """
+    logger.info("/subscribe user=%s args=%r", m.from_user.id if m.from_user else None, command.args)
     if not command.args:
         await m.answer("Формат:\n" + HELP)
         return
@@ -185,14 +221,13 @@ async def subscribe_cmd(m: Message, command: CommandObject):
         city_from_id, from_canonical = ensure_city(from_token)
         city_to_id, to_canonical = ensure_city(to_token)
     except ValueError as e:
+        logger.warning("subscribe: bad point token(s): from=%r to=%r user=%s", from_token, to_token, m.from_user.id if m.from_user else None)
         await m.answer(str(e) + "\nПодсказка: /points для списка точек.")
         return
     
     if m.from_user is None:
         await m.answer("Не могу определить твоего пользователя.")
         return
-    
-
     
     sid = storage.add_sub(
         user_id=m.from_user.id,
@@ -205,6 +240,10 @@ async def subscribe_cmd(m: Message, command: CommandObject):
         dep_to_hhmm=dep_to_hhmm,
     )
 
+    logger.info("subscribe ok: sub#%s user=%s %s(%s)->%s(%s) %s %s-%s",
+                sid, m.from_user.id, from_canonical, city_from_id, to_canonical, city_to_id,
+                date_str, dep_from_hhmm, dep_to_hhmm)
+
     await m.answer(
         f"✅ Подписка #{sid} добавлена:\n"
         f"{date_str} {from_canonical}({city_from_id}) → {to_canonical({city_to_id}) if False else to_canonical}({city_to_id}) "
@@ -213,6 +252,7 @@ async def subscribe_cmd(m: Message, command: CommandObject):
 
 @router.message(Command("unsubscribe"))
 async def unsubscribe_cmd(m: Message, command: CommandObject):
+    logger.info("/unsubscribe user=%s args=%r", m.from_user.id if m.from_user else None, command.args)
     if not command.args:
         await m.answer("Укажи ID: /unsubscribe <id>")
         return
@@ -226,10 +266,12 @@ async def unsubscribe_cmd(m: Message, command: CommandObject):
         return
     
     ok = storage.del_sub(m.from_user.id, sid)
+    logger.info("unsubscribe %s: sub#%s user=%s", "ok" if ok else "miss", sid, m.from_user.id if m.from_user else None)
     await m.answer(f"🗑 Подписка #{sid} удалена." if ok else "Не нашёл такую подписку.")
 
 @router.message(Command("subs"))
 async def subs_cmd(m: Message):
+    logger.info("/subs user=%s", m.from_user.id if m.from_user else None)
     items = storage.list_subs(m.from_user.id if m.from_user else 0)
     if not items:
         await m.answer("Подписок нет.")
@@ -244,6 +286,7 @@ async def subs_cmd(m: Message):
 
 @router.message(Command("status"))
 async def status_cmd(m: Message):
+    logger.info("/status user=%s", m.from_user.id if m.from_user else None)
     # глобальный статус проверок
     last_ts = storage.get_meta("last_check_ts")
     checks_count = storage.get_meta("checks_count") or "0"
@@ -268,6 +311,7 @@ async def status_cmd(m: Message):
 
     # Telegram лимит ~4096 символов на сообщение; если переживаешь — можно порезать на несколько сообщений
     await m.answer("\n".join(chunks))
+
 
 async def main():
     bot = Bot(TELEGRAM_BOT_TOKEN)
