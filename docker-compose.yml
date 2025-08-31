@@ -3,4 +3,4 @@ services:
     build: .
     restart: unless-stopped
   volumes:
-    - /db/ticket-bot/subs.json:/app/subs.json
+    - ../db:/app/db
